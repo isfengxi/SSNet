@@ -1,0 +1,33 @@
+# --- 数据与模型权重 (重点避免推送的部分) ---
+data/
+datasets/
+*.mat
+*.npz
+*.h5
+*.pth
+*.ckpt
+*.onnx
+
+# --- 仿真与运行日志 ---
+logs/
+results/
+temp/
+*.log
+
+# --- Python 缓存与环境 ---
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+env/
+venv/
+
+# --- IDE 与系统文件 ---
+.vscode/
+.idea/
+.DS_Store
+.ipynb_checkpoints/
+
+# --- 允许推送的文件 ---
+!README.md
+!.gitignore
