@@ -16,6 +16,7 @@ import os
 import time
 from pathlib import Path
 import logging
+import scipy.io
 
 import torch
 import torch.backends.cudnn as cudnn
@@ -36,8 +37,7 @@ import torch.nn.functional as F
 
 import models_mae
 
-from engine_pretrain import train_one_epoch
-from dataset_csi_optimized import build_dataloaders
+from engine_pretrain import train_one_epoch, evaluate  # 添加 evaluate
 
 
 def get_args_parser():
@@ -112,7 +112,11 @@ def get_args_parser():
                         choices=['0db', '5db', '10db', '15db', '20db'],
                         help='Noise level (default: clean data)')
 
+    parser.add_argument('--train_ratio', default=0.9, type=float,
+                        help='Ratio of dataset to use for training (default: 0.9)')
+
     return parser
+
 
 # 设置日志配置
 logging.basicConfig(level=logging.INFO,
@@ -124,46 +128,133 @@ logging.basicConfig(level=logging.INFO,
 
 
 class CSIDataset(Dataset):
-    def __init__(self, csv_files):
+    def __init__(self, mat_file, patch_size=2, precompute_mode=True):
+        """
+            precompute_mode:
+              - True: 直接加载预计算的自信息
+              - False: 实时计算自信息（仅用于预处理阶段）
+        """
+
+        mat_data = scipy.io.loadmat(mat_file)
+        self.pdp_data = mat_data['merged']  # 形状 (12032, 2048, 5)
+
         self.data = []
+        self.self_infos = []  # 存储预计算的自信息
         self.labels = []
-        self.normalize = transforms.Normalize(mean=[0.5, 0.5], std=[0.5, 0.5])
-        for file in csv_files:
-            df = pd.read_csv(file, header=None)
-            # 修改数据reshape和插值部分
-            data_tensor = torch.tensor(df.values, dtype=torch.float32).reshape(128, 64, 16)
+        self.patch_size = patch_size  # 定义 patch 的大小
+        self.precompute_mode = precompute_mode
+        self.precompute_dir = "precomputed_self_info"  # 预计算文件目录
 
-            # 将数据转换为适合插值的格式 [16, 128, 64]
-            data_tensor_trans = data_tensor.permute(2, 0, 1).unsqueeze(0)  # [1, 16, 128, 64]
-
-            # 插值到目标尺寸 (128, 128)
-            data_tensor_trans = F.interpolate(data_tensor_trans, size=(128, 128), mode='nearest')
-
-            # 将缩放后的张量恢复为 [16, 128, 128]
-            data_tensor = data_tensor_trans.squeeze(0)
-
+        # 处理每个样本
+        for idx in range(self.pdp_data.shape[0]):
+            # 提取样本并调整维度
+            sample = self.pdp_data[idx]  # (2048, 5)
+            # 仅保留后两个通道（索引3和4）
+            # sample = sample[:, 3:5]  # 形状变为 (2048, 2)
+            # 重塑为 (64, 32, 3) -> 插值为 (16, 64, 64)
+            data_tensor = torch.tensor(sample, dtype=torch.float32).reshape(64, 32, 5)
+            data_tensor_trans = data_tensor.permute(2, 0, 1).unsqueeze(0)  # (1, 2, 64, 32)
+            data_tensor_trans = F.interpolate(data_tensor_trans, size=(64, 64), mode='nearest')  # (1, 2, 64, 64)
+            data_tensor = data_tensor_trans.squeeze(0)  # (2, 64, 64)
             self.data.append(data_tensor)
-            label = os.path.splitext(os.path.basename(file))[0]
+
+            # 标签为文件名（去掉路径和扩展名）
+            label = os.path.splitext(os.path.basename(mat_file))[0]
             self.labels.append(label)
+
+            # 加载或计算自信息
+            # if self.precompute_mode:
+            #     # 从预处理文件加载
+            #     self_info_path = os.path.join(self.precompute_dir, f"{label}.pt")
+            #     if os.path.exists(self_info_path):
+            #         self_info = torch.load(self_info_path, weights_only=True)
+            #     else:
+            #         raise FileNotFoundError(f"预计算文件 {self_info_path} 不存在，请先运行 precompute_self_info.py")
+            #     self.self_infos.append(self_info)
+            # else:
+            #     # 预处理模式下不保存 self_infos
+            #     pass
 
     def __len__(self):
         return len(self.data)
 
     def __getitem__(self, idx):
-        image = self.data[idx]
-        return image, self.labels[idx]
+        if self.precompute_mode:
+            # 直接返回预计算的自信息
+            # return self.data[idx], self.self_infos[idx], self.labels[idx]
+            # 直接返回 (image, None, label)，保持三元组格式
+            # 假设图像大小为 64x64，patch_size 为 16，则 h = w = 4
+            h = w = 32
+            self_info = torch.zeros((h, w))  # 二维全零张量
+            return self.data[idx], self_info, self.labels[idx]  # 自信息占位为0
+        # else:
+        #     # 仅用于预处理脚本的计算模式
+        #     image = self.data[idx]
+        #     csi_data = self.patchify(image)
+        #     self_information = self.calculate_self_information(csi_data)
+        #     return image, self_information, self.labels[idx]
 
-def split_dataset(dataset, test_ratio=0.2):
-    """按比例划分数据集为训练集和测试集"""
-    test_size = int(len(dataset) * test_ratio)
-    train_size = len(dataset) - test_size
-    return torch.utils.data.random_split(dataset, [train_size, test_size])
+    def patchify(self, imgs):
+        """
+        imgs: (16, H, W)
+        x: (h, w, patch_size**2 * 16)
+        """
+        p = self.patch_size
+        assert imgs.shape[1] == imgs.shape[2] and imgs.shape[1] % p == 0
+
+        h = w = imgs.shape[1] // p
+        x = imgs.reshape(shape=(16, h, p, w, p))
+        x = torch.einsum('chpwq->hwpqc', x)
+        x = x.reshape(shape=(h, w, p ** 2 * 16))
+        return x
+
+    def calculate_self_information(self, csi_data, radius=3, band_width=1.0, patch_sampling_num=9):
+        """
+        计算自信息
+
+        Args:
+            csi_data: 形状为 (h, w, p ** 2 * 16) 的 CSI 数据
+            radius: 邻域半径
+            band_width: 带宽参数
+            patch_sampling_num: 随机采样邻域位置的数量
+
+        Returns:
+            self_information: 形状为 (h, w) 的自信息
+        """
+        Ny, Nx, num_channels = csi_data.shape
+        # 生成所有像素的坐标网格 (Ny, Nx)
+        y_coords, x_coords = torch.meshgrid(torch.arange(Ny), torch.arange(Nx), indexing='ij')
+
+        # 生成随机偏移矩阵 (Ny, Nx, patch_sampling_num, 2)
+        # 偏移范围 [-radius, radius]
+        offsets = torch.randint(-radius, radius + 1, (Ny, Nx, patch_sampling_num, 2), device=csi_data.device)
+
+        # 计算邻域坐标，限制在图像范围内
+        y_neighbor = torch.clamp(y_coords.unsqueeze(-1) + offsets[..., 0], 0, Ny - 1)
+        x_neighbor = torch.clamp(x_coords.unsqueeze(-1) + offsets[..., 1], 0, Nx - 1)
+
+        # 提取当前像素和邻域像素的向量 (Ny, Nx, patch_sampling_num, num_channels)
+        current_pixels = csi_data[y_coords, x_coords].unsqueeze(2)  # (Ny, Nx, 1, C)
+        neighbor_pixels = csi_data[y_neighbor, x_neighbor]  # (Ny, Nx, K, C)
+
+        # 计算欧氏距离 (Ny, Nx, K)
+        distances = torch.sum((current_pixels - neighbor_pixels) ** 2, dim=-1)
+
+        # 计算概率 (Ny, Nx, K)
+        mean_distances = torch.mean(distances, dim=-1, keepdim=True)  # (Ny, Nx, 1)
+        normalized_distances = distances / (mean_distances + 1e-6)  # 防止除零
+        probabilities = torch.exp(-normalized_distances / (2 * band_width ** 2))
+
+        # 平均概率并取反 (Ny, Nx)
+        self_information = 1 - torch.mean(probabilities, dim=-1)
+
+        return self_information
+
+
+
 
 def main(args):
     misc.init_distributed_mode(args)
-
-    global_rank = misc.get_rank()
-    num_tasks = misc.get_world_size()
 
     print('job dir: {}'.format(os.path.dirname(os.path.realpath(__file__))))
     print("{}".format(args).replace(', ', ',\n'))
@@ -171,15 +262,40 @@ def main(args):
     device = torch.device(args.device)
 
     # fix the seed for reproducibility
-    seed = args.seed + global_rank
+    seed = args.seed + misc.get_rank()
     torch.manual_seed(seed)
     np.random.seed(seed)
 
     cudnn.benchmark = True
 
     # 替换原有的图像数据集部分
-    data_loader_train, data_loader_test, sampler_train, sampler_test = \
-        build_dataloaders("/home/liuym/csi_preprocessed/", args)
+    mat_path = '/data/liuym/merged_features.mat'
+    dataset_full = CSIDataset(mat_path)
+
+    # 划分训练集和验证集
+    train_size = int(args.train_ratio * len(dataset_full))
+    val_size = len(dataset_full) - train_size
+    dataset_train, dataset_val = torch.utils.data.random_split(
+        dataset_full, [train_size, val_size],
+        generator=torch.Generator().manual_seed(args.seed)  # 固定随机种子以保证可复现性
+    )
+
+    # 打印数据集大小
+    logging.info(f"Full dataset size: {len(dataset_full)}")
+    logging.info(f"Training set size: {len(dataset_train)}")
+    logging.info(f"Validation set size: {len(dataset_val)}")
+
+
+    if True:  # args.distributed:
+        num_tasks = misc.get_world_size()
+        global_rank = misc.get_rank()
+        sampler_train = torch.utils.data.DistributedSampler(
+            dataset_train, num_replicas=num_tasks, rank=global_rank, shuffle=True
+        )
+        print("Sampler_train = %s" % str(sampler_train))
+    else:
+        sampler_train = torch.utils.data.RandomSampler(dataset_train)
+        print("Sampler_train is not be used")
 
     if global_rank == 0 and args.log_dir is not None:
         os.makedirs(args.log_dir, exist_ok=True)
@@ -187,9 +303,32 @@ def main(args):
     else:
         log_writer = None
 
-    
+    data_loader_train = torch.utils.data.DataLoader(
+        dataset_train, sampler=sampler_train,
+        batch_size=args.batch_size,
+        num_workers=args.num_workers,
+        pin_memory=args.pin_mem,
+        drop_last=True,
+    )
+
+    # 创建验证集的数据加载器
+    sampler_val = torch.utils.data.SequentialSampler(dataset_val)
+    data_loader_val = torch.utils.data.DataLoader(
+        dataset_val, sampler=sampler_val,
+        batch_size=args.batch_size,
+        num_workers=args.num_workers,
+        pin_memory=args.pin_mem,
+        drop_last=False,
+    )
+
+    # 假设 data_loader_train 是你的数据加载器
+    for samples, self_infos,_ in data_loader_train:
+        logging.info(f"Shape of samples: {samples.shape}")  # 记录张量的形状
+        logging.info(f"Shape of self_infos: {self_infos.shape}")  # 记录张量的形状
+        break  # 只打印第一批次的形状和数值
+
     # define the model
-    model = models_mae.__dict__[args.model](norm_pix_loss=args.norm_pix_loss, decoder_embed_dim=64, decoder_depth=4, decoder_num_heads=4, use_checkpoint=True, freeze_decoder_layers=0)
+    model = models_mae.__dict__[args.model](norm_pix_loss=args.norm_pix_loss)
 
     model.to(device)
 
@@ -197,7 +336,7 @@ def main(args):
     print("Model = %s" % str(model_without_ddp))
 
     eff_batch_size = args.batch_size * args.accum_iter * misc.get_world_size()
-    
+
     if args.lr is None:  # only base_lr is specified
         args.lr = args.blr * eff_batch_size / 256
 
@@ -210,40 +349,21 @@ def main(args):
     if args.distributed:
         model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu], find_unused_parameters=True)
         model_without_ddp = model.module
-    
+
     # following timm: set wd as 0 for bias and norm layers
     param_groups = optim_factory.add_weight_decay(model_without_ddp, args.weight_decay)
     optimizer = torch.optim.AdamW(param_groups, lr=args.lr, betas=(0.9, 0.95))
+    print(optimizer)
     loss_scaler = NativeScaler()
 
     misc.load_model(args=args, model_without_ddp=model_without_ddp, optimizer=optimizer, loss_scaler=loss_scaler)
 
-    # 测试函数
-    @torch.no_grad()
-    def evaluate(model, data_loader, device, args):
-        model.eval()
-        losses = []
-        nmses = []
-
-        for samples, _ in data_loader:
-            samples = samples.to(device, non_blocking=True)
-            with torch.cuda.amp.autocast():
-                loss, nmse, _, _ = model(samples, None, mask_ratio=args.mask_ratio)
-            losses.append(loss.item())
-            nmses.append(nmse.item())
-
-        avg_loss = np.mean(losses)
-        avg_nmse = np.mean(nmses)
-        return avg_loss, avg_nmse
-
     print(f"Start training for {args.epochs} epochs")
     start_time = time.time()
-
     for epoch in range(args.start_epoch, args.epochs):
+        # 训练
         if args.distributed:
             data_loader_train.sampler.set_epoch(epoch)
-
-        # 训练一个epoch
         train_stats = train_one_epoch(
             model, data_loader_train,
             optimizer, device, epoch, loss_scaler,
@@ -251,33 +371,18 @@ def main(args):
             args=args
         )
 
-        # 每5个epoch或在最后一个epoch测试一次
-        if (epoch % 10 == 0 or epoch + 1 == args.epochs) and data_loader_test is not None:
-            test_loss, test_nmse = evaluate(model, data_loader_test, device, args)
-            print(f"Test loss at epoch {epoch}: {test_loss:.4f}, NMSE: {test_nmse:.4f}")
+        # 验证
+        if epoch % 20 == 0 or epoch + 1 == args.epochs:  # 每20个epoch验证一次
+            val_stats = evaluate(model, data_loader_val, device, args)
+            logging.info(f"Validation stats: {val_stats}")
 
-            # 记录测试结果
-            if log_writer is not None:
-                log_writer.add_scalar('perf/test_loss', test_loss, epoch)
-                log_writer.add_scalar('perf/test_nmse', test_nmse, epoch)
-
-        # 定期保存模型
         if args.output_dir and (epoch % 20 == 0 or epoch + 1 == args.epochs):
             misc.save_model(
                 args=args, model=model, model_without_ddp=model_without_ddp, optimizer=optimizer,
                 loss_scaler=loss_scaler, epoch=epoch)
 
-        log_stats = {
-            **{f'train_{k}': v for k, v in train_stats.items()},
-            'epoch': epoch,
-        }
-
-        # 添加测试结果到日志
-        if (epoch % 5 == 0 or epoch + 1 == args.epochs) and data_loader_test is not None:
-            log_stats.update({
-                'test_loss': test_loss,
-                'test_nmse': test_nmse
-            })
+        log_stats = {**{f'train_{k}': v for k, v in train_stats.items()},
+                     'epoch': epoch, }
 
         if args.output_dir and misc.is_main_process():
             if log_writer is not None:
@@ -296,3 +401,4 @@ if __name__ == '__main__':
     if args.output_dir:
         Path(args.output_dir).mkdir(parents=True, exist_ok=True)
     main(args)
+
