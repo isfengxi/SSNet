@@ -29,7 +29,7 @@ def train_one_epoch(model: torch.nn.Module,
     print(f"Using GPUs: {torch.cuda.device_count()}")
     print(f"Current GPU: {torch.cuda.current_device()}")
 
-    
+
     model.train(True)
     metric_logger = misc.MetricLogger(delimiter="  ")
     metric_logger.add_meter('lr', misc.SmoothedValue(window_size=1, fmt='{value:.6f}'))
@@ -44,7 +44,7 @@ def train_one_epoch(model: torch.nn.Module,
         print('log_dir: {}'.format(log_writer.log_dir))
 
     # print("Data loader output:", next(iter(data_loader)))
-    for data_iter_step, (samples, _) in enumerate(metric_logger.log_every(data_loader, print_freq, header)):
+    for data_iter_step, (samples, self_infos, _) in enumerate(metric_logger.log_every(data_loader, print_freq, header)):
 
         # we use a per iteration (instead of per epoch) lr scheduler
         if data_iter_step % accum_iter == 0:
@@ -52,8 +52,8 @@ def train_one_epoch(model: torch.nn.Module,
 
         samples = samples.to(device, non_blocking=True)
 
-        with torch.cuda.amp.autocast(dtype=torch.bfloat16):
-            loss, NMSE, _, _ = model(samples, mask_ratio=args.mask_ratio)
+        with torch.cuda.amp.autocast():
+            loss, NMSE, _, _ = model(samples, self_infos, mask_ratio=args.mask_ratio)
 
         # main_pretrain.logging.info(f"___NMSE____: {NMSE.item()}")
         NMSE_value = NMSE.item()
@@ -68,7 +68,6 @@ def train_one_epoch(model: torch.nn.Module,
                     update_grad=(data_iter_step + 1) % accum_iter == 0)
         if (data_iter_step + 1) % accum_iter == 0:
             optimizer.zero_grad()
-            torch.cuda.empty_cache()
 
         torch.cuda.synchronize()
 
@@ -92,3 +91,27 @@ def train_one_epoch(model: torch.nn.Module,
     metric_logger.synchronize_between_processes()
     print("Averaged stats:", metric_logger)
     return {k: meter.global_avg for k, meter in metric_logger.meters.items()}
+
+    torch.cuda.empty_cache()
+
+
+def evaluate(model: torch.nn.Module, data_loader: Iterable, device: torch.device, args):
+    model.eval()
+    metric_logger = misc.MetricLogger(delimiter="  ")
+    header = 'Validation:'
+
+    for samples, self_infos, _ in metric_logger.log_every(data_loader, 10, header):
+        samples = samples.to(device, non_blocking=True)
+
+        with torch.no_grad(), torch.cuda.amp.autocast():
+            loss, NMSE, _, _ = model(samples, self_infos, mask_ratio=args.mask_ratio)
+
+        loss_value = loss.item()
+        NMSE_value = NMSE.item()
+
+        metric_logger.update(loss=loss_value, NMSE=NMSE_value)
+
+    # 同步所有进程的统计信息
+    metric_logger.synchronize_between_processes()
+    return {k: meter.global_avg for k, meter in metric_logger.meters.items()}
+
