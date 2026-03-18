@@ -1,0 +1,28 @@
+.
+├── ./batch_eval.py
+├── ./dataset_csi_optimized.py
+├── ./demo
+│   └── ./demo/mae_visualize.ipynb
+├── ./engine_pretrain.py
+├── ./file_tree.txt
+├── ./main_pretrain.py
+├── ./model_eval_huabu.py
+├── ./model_eval_time.py
+├── ./models_mae.py
+├── ./models_vit.py
+├── ./noisemaker_pre.py
+├── ./precompute_self_info_no_patch.py
+├── ./precompute_self_info.py
+├── ./submitit_pretrain.py
+├── ./util
+│   ├── ./util/crop.py
+│   ├── ./util/datasets.py
+│   ├── ./util/lars.py
+│   ├── ./util/lr_decay.py
+│   ├── ./util/lr_sched.py
+│   ├── ./util/misc.py
+│   └── ./util/pos_embed.py
+├── ./visualize_self_info.py
+└── ./vit_moe.py
+
+2 directories, 23 files
